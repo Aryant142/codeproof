@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import * as dotenv from 'dotenv';
-import { db } from '../src/lib/firebase';
+import { db } from '../src/lib/firebase.js';
 
 dotenv.config();
 
