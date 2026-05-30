@@ -779,20 +779,24 @@ int main() {
                 }
               }
 
-              for (const tf of targetFiles) {
-                // Fetch file code
-                const fileRawRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${tf.path}`, { headers });
-                if (fileRawRes.ok) {
-                  const contentString = await fileRawRes.text();
-                  const extension = tf.path.split('.').pop() || 'tmp';
-                  filesCollected.push({
-                    filePath: tf.path,
-                    fileName: tf.path.split('/').pop() || tf.path,
-                    language: extension.toUpperCase(),
-                    codeSample: contentString.substring(0, 1500)
-                  });
-                }
-              }
+              const fileFetchPromises = targetFiles.map(async (tf) => {
+                try {
+                  const fileRawRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${tf.path}`, { headers });
+                  if (fileRawRes.ok) {
+                    const contentString = await fileRawRes.text();
+                    const extension = tf.path.split('.').pop() || 'tmp';
+                    return {
+                      filePath: tf.path,
+                      fileName: tf.path.split('/').pop() || tf.path,
+                      language: extension.toUpperCase(),
+                      codeSample: contentString.substring(0, 1500)
+                    };
+                  }
+                } catch (e) {}
+                return null;
+              });
+              const fetchedFiles = await Promise.all(fileFetchPromises);
+              filesCollected = fetchedFiles.filter((f): f is any => f !== null);
             }
           } catch (e) {
             console.warn(`Could not fetch actual files from raw branch for student ${s.studentName}.`);
