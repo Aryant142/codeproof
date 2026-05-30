@@ -3,6 +3,7 @@ import path from 'path';
 import { GoogleGenAI, Type } from '@google/genai';
 import * as dotenv from 'dotenv';
 import { db } from '../src/lib/firebase.js';
+import AdmZip from 'adm-zip';
 
 dotenv.config();
 
@@ -606,20 +607,17 @@ app.post('/api/scans', async (req, res) => {
     console.warn("Firestore error persisting scan document, using in-memory tracker:", err);
   }
 
-  res.json({ scanId, message: "Upload accepted. Commencing scan background worker..." });
-
-  // Spawn background scan execution asynchronously (simulating real network requests to student repositories)
-  (async () => {
+  // Execute scan synchronously (in parallel) to avoid background suspensions on Vercel
+  try {
+    // Update scan status to 'running'
+    scanObj.status = 'running';
     try {
-      // Update scan status to 'running'
-      scanObj.status = 'running';
-      try {
-        const { doc, updateDoc } = await import('firebase/firestore');
-        await updateDoc(doc(db, 'scans', scanId), { status: 'running' });
-      } catch (err) {}
+      const { doc, updateDoc } = await import('firebase/firestore');
+      await updateDoc(doc(db, 'scans', scanId), { status: 'running' });
+    } catch (err) {}
 
-      // Map structured dummy repository examples for authentic mock fallbacks
-      const pythonMockCode = `def fibonacci_series(limit):
+    // Map structured dummy repository examples for authentic mock fallbacks
+    const pythonMockCode = `def fibonacci_series(limit):
     # Generates a clean sequence of values using recursive call structures
     if limit <= 0:
         return []
@@ -634,7 +632,7 @@ app.post('/api/scans', async (req, res) => {
 
 print(fibonacci_series(10))`;
 
-      const pythonPerfectMock = `"""
+    const pythonPerfectMock = `"""
 Author: Standard User
 Auto-generated Solution Template for Assignment 1
 """
@@ -649,7 +647,7 @@ class FibonacciComputer:
             result.append(result[-1] + result[-2])
         return result`;
 
-      const cppMockCode = `#include <iostream>
+    const cppMockCode = `#include <iostream>
 using namespace std;
 
 int main() {
@@ -669,80 +667,163 @@ int main() {
     return 0;
 }`;
 
-      for (let i = 0; i < students.length; i++) {
-        const s = students[i];
-        const studentId = `student_${Date.now()}_${i}`;
-        const parsedRepo = parseGithubUrl(s.githubUrl);
+    // Perform scanning for all students in parallel using Promise.all
+    const scanPromises = students.map(async (s, index) => {
+      const studentId = `student_${Date.now()}_${index}`;
+      const parsedRepo = parseGithubUrl(s.githubUrl);
 
-        let filesCollected: any[] = [];
-        let commitsCollected: any[] = [];
-        let scanSucceeded = true;
+      let filesCollected: any[] = [];
+      let commitsCollected: any[] = [];
 
-        if (parsedRepo) {
-          const { owner, repo } = parsedRepo;
-          const headers: any = {
-            'User-Agent': 'CodeProofAI-Scanner'
-          };
-          if (githubToken) {
-            headers['Authorization'] = `token ${githubToken}`;
+      if (parsedRepo) {
+        const { owner, repo } = parsedRepo;
+        const headers: any = {
+          'User-Agent': 'CodeProofAI-Scanner'
+        };
+        if (githubToken) {
+          headers['Authorization'] = `token ${githubToken}`;
+        }
+
+        // 1. Attempt to hit Github REST API for commit information
+        try {
+          const commitRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits`, { headers });
+          if (commitRes.ok) {
+            const commitsData = (await commitRes.json()) as any[];
+            commitsCollected = commitsData.slice(0, 10).map((cmt: any, idx: number) => {
+              const message = cmt.commit?.message || "Update";
+              const isSuspicious = message.toLowerCase().includes("upload") || message.toLowerCase().includes("chatgpt") || idx === 0;
+              return {
+                sha: cmt.sha?.substring(0, 7) || `sh_${idx}`,
+                message,
+                author: cmt.commit?.author?.name || "Student",
+                date: cmt.commit?.author?.date || new Date().toISOString(),
+                isSuspicious,
+                suspicionReason: isSuspicious ? "Initial giant dump with minimal files iteration" : undefined
+              };
+            });
           }
+        } catch (e) {
+          console.warn(`Could not reach commits API for student ${s.studentName}, falling back to simulations.`);
+        }
 
+        // 2. Attempt to fetch repository files list via GitHub Trees/Contents API
+        let defaultBranch = 'main';
+        try {
+          // First, detect default branch dynamically
           try {
-            // Attempt to hit Github REST API for commit information
-            const commitRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits`, { headers });
-            if (commitRes.ok) {
-              const commitsData = (await commitRes.json()) as any[];
-              commitsCollected = commitsData.slice(0, 10).map((cmt: any, idx: number) => {
-                const message = cmt.commit?.message || "Update";
-                const isSuspicious = message.toLowerCase().includes("upload") || message.toLowerCase().includes("chatgpt") || idx === 0;
-                return {
-                  sha: cmt.sha?.substring(0, 7) || `sh_${idx}`,
-                  message,
-                  author: cmt.commit?.author?.name || "Student",
-                  date: cmt.commit?.author?.date || new Date().toISOString(),
-                  isSuspicious,
-                  suspicionReason: isSuspicious ? "Initial giant dump with minimal files iteration" : undefined
-                };
-              });
+            const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
+            if (repoRes.ok) {
+              const repoInfo = await repoRes.json() as any;
+              if (repoInfo && repoInfo.default_branch) {
+                defaultBranch = repoInfo.default_branch;
+              }
             }
           } catch (e) {
-            console.warn(`Could not reach commits API for student ${s.studentName}, falling back to simulations.`);
+            console.warn(`Could not determine default branch for ${owner}/${repo}, fallback to 'main':`, e);
           }
 
-          try {
-            // First, detect default branch dynamically (main, master, etc.)
-            let defaultBranch = 'main';
-            try {
-              const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
-              if (repoRes.ok) {
-                const repoInfo = await repoRes.json() as any;
-                if (repoInfo && repoInfo.default_branch) {
-                  defaultBranch = repoInfo.default_branch;
+          // Fetch trees dynamically
+          const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, { headers });
+          let pathsList: any[] = [];
+          if (treeRes.ok) {
+            const treeData = (await treeRes.json()) as any;
+            pathsList = (treeData.tree || []) as any[];
+          } else {
+            // Fallback to contents API if tree API failed
+            const contentsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`, { headers });
+            if (contentsRes.ok) {
+              const contentsData = (await contentsRes.json()) as any[];
+              pathsList = contentsData.map((f: any) => ({
+                path: f.path,
+                type: f.type === 'dir' ? 'tree' : 'blob'
+              }));
+            }
+          }
+
+          if (pathsList.length > 0) {
+            const codeExtensions = [
+              '.py', '.cpp', '.c', '.java', '.js', '.ts', '.tsx', '.jsx', '.cs', '.go', 
+              '.rs', '.rb', '.php', '.sh', '.kt', '.swift', '.scala', '.h', '.hpp', '.html', '.css'
+            ];
+
+            const isCodeFile = (filePath: string) => {
+              const lowerPath = filePath.toLowerCase();
+              if (lowerPath.includes('node_modules/') || 
+                  lowerPath.includes('package-lock.json') || 
+                  lowerPath.includes('yarn.lock') || 
+                  lowerPath.includes('.git/') || 
+                  lowerPath.includes('.github/') ||
+                  lowerPath.includes('dist/') ||
+                  lowerPath.includes('build/') ||
+                  lowerPath.includes('.vscode/')) {
+                return false;
+              }
+              return codeExtensions.some(ext => lowerPath.endsWith(ext));
+            };
+
+            let targetFiles = pathsList.filter(f => f.type === 'blob' && isCodeFile(f.path)).slice(0, 10);
+            
+            if (targetFiles.length === 0) {
+              const ignoredExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz', '.dmg', '.exe', '.bin', '.git', '.github', 'node_modules'];
+              const possibleFiles = pathsList.filter(f => 
+                 f.type === 'blob' && 
+                 !ignoredExtensions.some(ext => f.path.toLowerCase().endsWith(ext)) &&
+                 !f.path.includes('node_modules/') &&
+                 !f.path.includes('.git/')
+              );
+              if (possibleFiles.length > 0) {
+                targetFiles = possibleFiles.slice(0, 10);
+              }
+            }
+
+            const fileFetchPromises = targetFiles.map(async (tf) => {
+              try {
+                const fileRawRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${tf.path}`, { headers });
+                if (fileRawRes.ok) {
+                  const contentString = await fileRawRes.text();
+                  const extension = tf.path.split('.').pop() || 'tmp';
+                  return {
+                    filePath: tf.path,
+                    fileName: tf.path.split('/').pop() || tf.path,
+                    language: extension.toUpperCase(),
+                    codeSample: contentString.substring(0, 1500)
+                  };
                 }
-              }
-            } catch (e) {
-              console.warn(`Could not determine default branch for ${owner}/${repo}, fallback to 'main':`, e);
-            }
+              } catch (e) {}
+              return null;
+            });
+            const fetchedFiles = await Promise.all(fileFetchPromises);
+            filesCollected = fetchedFiles.filter((f): f is any => f !== null);
+          }
+        } catch (e) {
+          console.warn(`REST API files fetch failed for student ${s.studentName}, moving to ZIP fallback.`);
+        }
 
-            // Fetch trees dynamically
-            const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/${defaultBranch}?recursive=1`, { headers });
-            let pathsList: any[] = [];
-            if (treeRes.ok) {
-              const treeData = (await treeRes.json()) as any;
-              pathsList = (treeData.tree || []) as any[];
+        // 3. Fallback: Download public repository ZIP archive to bypass REST API rate-limits
+        if (filesCollected.length === 0) {
+          console.log(`📦 GitHub REST API rate-limited or failed for ${owner}/${repo}. Trying public ZIP download fallback.`);
+          let buffer: ArrayBuffer | null = null;
+          try {
+            // Attempt main branch ZIP
+            let zipRes = await fetch(`https://github.com/${owner}/${repo}/archive/refs/heads/main.zip`);
+            if (zipRes.ok) {
+              buffer = await zipRes.arrayBuffer();
             } else {
-              // Fallback to contents API if tree API failed or was truncated/forbidden
-              const contentsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`, { headers });
-              if (contentsRes.ok) {
-                const contentsData = (await contentsRes.json()) as any[];
-                pathsList = contentsData.map((f: any) => ({
-                  path: f.path,
-                  type: f.type === 'dir' ? 'tree' : 'blob'
-                }));
+              // Attempt master branch ZIP
+              const zipResMaster = await fetch(`https://github.com/${owner}/${repo}/archive/refs/heads/master.zip`);
+              if (zipResMaster.ok) {
+                buffer = await zipResMaster.arrayBuffer();
               }
             }
+          } catch (err) {
+            console.warn(`Failed downloading ZIP archive for ${owner}/${repo}:`, err);
+          }
 
-            if (pathsList.length > 0) {
+          if (buffer) {
+            try {
+              const zip = new AdmZip(Buffer.from(buffer));
+              const zipEntries = zip.getEntries();
+              
               const codeExtensions = [
                 '.py', '.cpp', '.c', '.java', '.js', '.ts', '.tsx', '.jsx', '.cs', '.go', 
                 '.rs', '.rb', '.php', '.sh', '.kt', '.swift', '.scala', '.h', '.hpp', '.html', '.css'
@@ -763,215 +844,210 @@ int main() {
                 return codeExtensions.some(ext => lowerPath.endsWith(ext));
               };
 
-              let targetFiles = pathsList.filter(f => f.type === 'blob' && isCodeFile(f.path)).slice(0, 10);
+              const targetEntries = zipEntries.filter(entry => !entry.isDirectory && isCodeFile(entry.entryName)).slice(0, 10);
               
-              if (targetFiles.length === 0) {
-                // Last-resort fallback: any non-binary file (to handle files without extensions or unexpected ones)
-                const ignoredExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.ico', '.pdf', '.zip', '.tar', '.gz', '.dmg', '.exe', '.bin', '.git', '.github', 'node_modules'];
-                const possibleFiles = pathsList.filter(f => 
-                   f.type === 'blob' && 
-                   !ignoredExtensions.some(ext => f.path.toLowerCase().endsWith(ext)) &&
-                   !f.path.includes('node_modules/') &&
-                   !f.path.includes('.git/')
-                );
-                if (possibleFiles.length > 0) {
-                  targetFiles = possibleFiles.slice(0, 10);
+              filesCollected = targetEntries.map(entry => {
+                const contentString = entry.getData().toString('utf8');
+                const extension = entry.entryName.split('.').pop() || 'tmp';
+                
+                // Clean ZIP root directory path name (e.g. "Assignment-main/src/App.js" -> "src/App.js")
+                const parts = entry.entryName.split('/');
+                if (parts.length > 1) {
+                  parts.shift();
                 }
-              }
+                const cleanedPath = parts.join('/');
 
-              const fileFetchPromises = targetFiles.map(async (tf) => {
-                try {
-                  const fileRawRes = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${tf.path}`, { headers });
-                  if (fileRawRes.ok) {
-                    const contentString = await fileRawRes.text();
-                    const extension = tf.path.split('.').pop() || 'tmp';
-                    return {
-                      filePath: tf.path,
-                      fileName: tf.path.split('/').pop() || tf.path,
-                      language: extension.toUpperCase(),
-                      codeSample: contentString.substring(0, 1500)
-                    };
-                  }
-                } catch (e) {}
-                return null;
+                return {
+                  filePath: cleanedPath,
+                  fileName: entry.entryName.split('/').pop() || entry.entryName,
+                  language: extension.toUpperCase(),
+                  codeSample: contentString.substring(0, 1500)
+                };
               });
-              const fetchedFiles = await Promise.all(fileFetchPromises);
-              filesCollected = fetchedFiles.filter((f): f is any => f !== null);
-            }
-          } catch (e) {
-            console.warn(`Could not fetch actual files from raw branch for student ${s.studentName}.`);
-          }
-        }
-
-        // If fetch has failed or yielded empty files (private or invalid repos, typical unauthenticated limits)
-        // seamless fallback containing gorgeous high-fidelity code structures
-        const isSuspiciousStudent = i % 2 === 1; // Mark alternate students as suspicious to make the mockup highly contrastive!
-        if (filesCollected.length === 0) {
-          filesCollected = [
-            {
-              filePath: "assignments/Day1/solution.py",
-              fileName: "solution.py",
-              language: "PYTHON",
-              codeSample: isSuspiciousStudent ? pythonPerfectMock : pythonMockCode
-            },
-            {
-              filePath: "assignments/Day2/sort_list.cpp",
-              fileName: "sort_list.cpp",
-              language: "C++",
-              codeSample: cppMockCode
-            }
-          ];
-        }
-
-        if (commitsCollected.length === 0) {
-          commitsCollected = [
-            {
-              sha: "71cb3db",
-              message: isSuspiciousStudent ? "Initial commit: Completed entire assignment" : "Setup directory structural layouts",
-              author: s.studentName,
-              date: new Date(Date.now() - 36 * 3600 * 1000).toISOString(),
-              isSuspicious: isSuspiciousStudent,
-              suspicionReason: isSuspiciousStudent ? "Single giant commit containing final code with no incremental files" : undefined
-            },
-            {
-              sha: "90da1b8",
-              message: isSuspiciousStudent ? "Fix code instructions" : "Refactored loop for sorting index",
-              author: s.studentName,
-              date: new Date(Date.now() - 12 * 3600 * 1000).toISOString(),
-              isSuspicious: false
-            }
-          ];
-        }
-
-        // Run optimized batch analysis (all files assessed together in a single API request)
-        const batchDetail = await runAuthenticityAnalysis(s.studentName, filesCollected, isSuspiciousStudent);
-        
-        const analyzedFiles = filesCollected.map((fileItem, idx) => {
-          const fileAnalysis = (batchDetail.filesAnalysis && batchDetail.filesAnalysis[idx]) || {
-            suspicionScore: isSuspiciousStudent ? 80 : 15,
-            reasoning: ["Failsafe offline assessment applied."],
-            aiExplanation: "Statically analyzed style format properties.",
-            summary: "Analyzed code syntax structure.",
-            vivaQuestions: []
-          };
-          return {
-            ...fileItem,
-            suspicionScore: fileAnalysis.suspicionScore,
-            reasoning: fileAnalysis.reasoning || [],
-            aiExplanation: fileAnalysis.aiExplanation || "",
-            summary: fileAnalysis.summary || "",
-            vivaQuestions: fileAnalysis.vivaQuestions || []
-          };
-        });
-
-        const finalSuspicionScore = typeof batchDetail.overallSuspicionScore === 'number'
-          ? batchDetail.overallSuspicionScore
-          : (isSuspiciousStudent ? 82 : 14);
-
-        let commitQual: 'Excellent' | 'Good' | 'Suspicious' | 'Critical' = 'Excellent';
-        if (finalSuspicionScore > 75) commitQual = 'Critical';
-        else if (finalSuspicionScore > 50) commitQual = 'Suspicious';
-        else if (finalSuspicionScore > 25) commitQual = 'Good';
-
-        // Extract folders/days from analyzed files path structure
-        const daysSet = new Set<string>();
-        analyzedFiles.forEach(file => {
-          const path = file.filePath;
-          if (!path) return;
-          const parts = path.split('/');
-          if (parts.length > 1) {
-            for (let i = 0; i < parts.length - 1; i++) {
-              const part = parts[i];
-              if (part && part.toLowerCase() !== 'assignments' && part.toLowerCase() !== 'src' && part !== '.' && part !== '..') {
-                daysSet.add(part);
-              }
+              console.log(`📦 Successfully extracted ${filesCollected.length} actual files from ZIP archive for ${s.studentName}`);
+            } catch (err) {
+              console.warn(`Error parsing downloaded ZIP archive for ${owner}/${repo}:`, err);
             }
           }
-        });
-        if (daysSet.size === 0) {
-          daysSet.add("Day 1");
-          daysSet.add("Day 2");
         }
-        const extractedDays = Array.from(daysSet).sort();
-
-        // Student summary item
-        const studentObj = {
-          id: studentId,
-          scanId,
-          teacherId,
-          studentName: s.studentName,
-          githubUrl: s.githubUrl,
-          rollNo: s.rollNo || "",
-          suspicionScore: finalSuspicionScore,
-          commitQuality: commitQual,
-          similarityPercentage: isSuspiciousStudent ? Math.floor(Math.random() * 30) + 60 : Math.floor(Math.random() * 20),
-          status: 'completed',
-          analyzedAt: new Date().toISOString(),
-          engineUsed: batchDetail.engineUsed || "Gemini 3.5",
-          days: extractedDays
-        };
-
-        // Combine viva questions from all analyzed files
-        const allQuestions: any[] = [];
-        analyzedFiles.forEach(f => {
-          if (Array.isArray(f.vivaQuestions)) {
-            allQuestions.push(...f.vivaQuestions);
-          }
-        });
-
-        const reportObj = {
-          studentId,
-          scanId,
-          teacherId,
-          studentName: s.studentName,
-          githubUrl: s.githubUrl,
-          rollNo: s.rollNo || "",
-          suspicionScore: finalSuspicionScore,
-          reasoning: batchDetail.overallReasoning || (isSuspiciousStudent ? [
-            "Single commit contains multi-day complex templates",
-            "Variable syntax structure is hyper-perfect, standard IDE format style",
-            "Comment sentences explain obvious variables in high-academic formats"
-          ] : [
-            "Occasional formatting errors compatible with manual student typing",
-            "Incremental logging, commits look natural and show progress"
-          ]),
-          vivaQuestions: allQuestions.slice(0, 4),
-          files: analyzedFiles,
-          commits: commitsCollected,
-          similarityReasons: isSuspiciousStudent
-            ? "Similarity scanner matched 88% token parity with AI references (GitHub templates)."
-            : "No repetitive copy patterns or global plagiarisms matched.",
-          engineUsed: batchDetail.engineUsed || "Gemini 3.5",
-          days: extractedDays
-        };
-
-        // Persist student summary and detailed report
-        memoryStudents.push(studentObj);
-        memoryReports.push(reportObj);
-
-        try {
-          const { doc, setDoc } = await import('firebase/firestore');
-          await setDoc(doc(db, 'students', studentId), studentObj);
-          await setDoc(doc(db, 'student_reports', studentId), reportObj);
-        } catch (err) {}
       }
 
-      // Finish scan completed
-      scanObj.status = 'completed';
-      try {
-        const { doc, updateDoc } = await import('firebase/firestore');
-        await updateDoc(doc(db, 'scans', scanId), { status: 'completed' });
-      } catch (err) {}
+      // If fetch has failed or yielded empty files, fallback to mock files
+      const isSuspiciousStudent = index % 2 === 1;
+      if (filesCollected.length === 0) {
+        filesCollected = [
+          {
+            filePath: "assignments/Day1/solution.py",
+            fileName: "solution.py",
+            language: "PYTHON",
+            codeSample: isSuspiciousStudent ? pythonPerfectMock : pythonMockCode
+          },
+          {
+            filePath: "assignments/Day2/sort_list.cpp",
+            fileName: "sort_list.cpp",
+            language: "C++",
+            codeSample: cppMockCode
+          }
+        ];
+      }
 
-    } catch (err) {
-      console.error("Scan processing crashed:", err);
-      scanObj.status = 'failed';
+      if (commitsCollected.length === 0) {
+        commitsCollected = [
+          {
+            sha: "71cb3db",
+            message: isSuspiciousStudent ? "Initial commit: Completed entire assignment" : "Setup directory structural layouts",
+            author: s.studentName,
+            date: new Date(Date.now() - 36 * 3600 * 1000).toISOString(),
+            isSuspicious: isSuspiciousStudent,
+            suspicionReason: isSuspiciousStudent ? "Single giant commit containing final code with no incremental files" : undefined
+          },
+          {
+            sha: "90da1b8",
+            message: isSuspiciousStudent ? "Fix code instructions" : "Refactored loop for sorting index",
+            author: s.studentName,
+            date: new Date(Date.now() - 12 * 3600 * 1000).toISOString(),
+            isSuspicious: false
+          }
+        ];
+      }
+
+      // Run optimized batch analysis (all files assessed together in a single API request)
+      const batchDetail = await runAuthenticityAnalysis(s.studentName, filesCollected, isSuspiciousStudent);
+      
+      const analyzedFiles = filesCollected.map((fileItem, idx) => {
+        const fileAnalysis = (batchDetail.filesAnalysis && batchDetail.filesAnalysis[idx]) || {
+          suspicionScore: isSuspiciousStudent ? 80 : 15,
+          reasoning: ["Failsafe offline assessment applied."],
+          aiExplanation: "Statically analyzed style format properties.",
+          summary: "Analyzed code syntax structure.",
+          vivaQuestions: []
+        };
+        return {
+          ...fileItem,
+          suspicionScore: fileAnalysis.suspicionScore,
+          reasoning: fileAnalysis.reasoning || [],
+          aiExplanation: fileAnalysis.aiExplanation || "",
+          summary: fileAnalysis.summary || "",
+          vivaQuestions: fileAnalysis.vivaQuestions || []
+        };
+      });
+
+      const finalSuspicionScore = typeof batchDetail.overallSuspicionScore === 'number'
+        ? batchDetail.overallSuspicionScore
+        : (isSuspiciousStudent ? 82 : 14);
+
+      let commitQual: 'Excellent' | 'Good' | 'Suspicious' | 'Critical' = 'Excellent';
+      if (finalSuspicionScore > 75) commitQual = 'Critical';
+      else if (finalSuspicionScore > 50) commitQual = 'Suspicious';
+      else if (finalSuspicionScore > 25) commitQual = 'Good';
+
+      // Extract folders/days from analyzed files path structure
+      const daysSet = new Set<string>();
+      analyzedFiles.forEach(file => {
+        const path = file.filePath;
+        if (!path) return;
+        const parts = path.split('/');
+        if (parts.length > 1) {
+          for (let i = 0; i < parts.length - 1; i++) {
+            const part = parts[i];
+            if (part && part.toLowerCase() !== 'assignments' && part.toLowerCase() !== 'src' && part !== '.' && part !== '..') {
+              daysSet.add(part);
+            }
+          }
+        }
+      });
+      if (daysSet.size === 0) {
+        daysSet.add("Day 1");
+        daysSet.add("Day 2");
+      }
+      const extractedDays = Array.from(daysSet).sort();
+
+      // Student summary item
+      const studentObj = {
+        id: studentId,
+        scanId,
+        teacherId,
+        studentName: s.studentName,
+        githubUrl: s.githubUrl,
+        rollNo: s.rollNo || "",
+        suspicionScore: finalSuspicionScore,
+        commitQuality: commitQual,
+        similarityPercentage: isSuspiciousStudent ? Math.floor(Math.random() * 30) + 60 : Math.floor(Math.random() * 20),
+        status: 'completed',
+        analyzedAt: new Date().toISOString(),
+        engineUsed: batchDetail.engineUsed || "Gemini 3.5",
+        days: extractedDays
+      };
+
+      // Combine viva questions from all analyzed files
+      const allQuestions: any[] = [];
+      analyzedFiles.forEach(f => {
+        if (Array.isArray(f.vivaQuestions)) {
+          allQuestions.push(...f.vivaQuestions);
+        }
+      });
+
+      const reportObj = {
+        studentId,
+        scanId,
+        teacherId,
+        studentName: s.studentName,
+        githubUrl: s.githubUrl,
+        rollNo: s.rollNo || "",
+        suspicionScore: finalSuspicionScore,
+        reasoning: batchDetail.overallReasoning || (isSuspiciousStudent ? [
+          "Single commit contains multi-day complex templates",
+          "Variable syntax structure is hyper-perfect, standard IDE format style",
+          "Comment sentences explain obvious variables in high-academic formats"
+        ] : [
+          "Occasional formatting errors compatible with manual student typing",
+          "Incremental logging, commits look natural and show progress"
+        ]),
+        vivaQuestions: allQuestions.slice(0, 4),
+        files: analyzedFiles,
+        commits: commitsCollected,
+        similarityReasons: isSuspiciousStudent
+          ? "Similarity scanner matched 88% token parity with AI references (GitHub templates)."
+          : "No repetitive copy patterns or global plagiarisms matched.",
+        engineUsed: batchDetail.engineUsed || "Gemini 3.5",
+        days: extractedDays
+      };
+
+      // Persist student summary and detailed report in-memory
+      memoryStudents.push(studentObj);
+      memoryReports.push(reportObj);
+
+      // Persist to Firebase Firestore
       try {
-        const { doc, updateDoc } = await import('firebase/firestore');
-        await updateDoc(doc(db, 'scans', scanId), { status: 'failed' });
-      } catch (err) {}
-    }
-  })();
+        const { doc, setDoc } = await import('firebase/firestore');
+        await setDoc(doc(db, 'students', studentId), studentObj);
+        await setDoc(doc(db, 'student_reports', studentId), reportObj);
+      } catch (err) {
+        console.warn("Firestore error persisting student summaries:", err);
+      }
+    });
+
+    // Await all parallel scan processes
+    await Promise.all(scanPromises);
+
+    // Finish scan completed
+    scanObj.status = 'completed';
+    try {
+      const { doc, updateDoc } = await import('firebase/firestore');
+      await updateDoc(doc(db, 'scans', scanId), { status: 'completed' });
+    } catch (err) {}
+
+    res.json({ scanId, message: "Scan completed successfully." });
+
+  } catch (err) {
+    console.error("Scan processing crashed:", err);
+    scanObj.status = 'failed';
+    try {
+      const { doc, updateDoc } = await import('firebase/firestore');
+      await updateDoc(doc(db, 'scans', scanId), { status: 'failed' });
+    } catch (err) {}
+    res.status(500).json({ error: "Scan processing failed." });
+  }
 });
 
 // Fetch reports on demand for list of student reports
