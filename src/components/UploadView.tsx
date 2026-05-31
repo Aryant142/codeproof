@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import { 
   UploadCloud, 
   FileSpreadsheet, 
+  FileText,
   Trash2, 
   Play, 
   HelpCircle, 
@@ -38,10 +39,43 @@ export default function UploadView({ scans, onStartAnalysis, onSelectScan, onDel
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Parse excel or CSV tables layout
+  // Parse excel, CSV, or PDF rosters
   const processFileData = (file: File) => {
     setErrorMsg(null);
     setUploading(true);
+
+    if (file.name.toLowerCase().endsWith('.pdf')) {
+      fetch('/api/parse-pdf', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/pdf'
+        },
+        body: file
+      })
+      .then(async (res) => {
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.error || "Failed to parse PDF file.");
+        }
+        return res.json();
+      })
+      .then((data) => {
+        if (data.students && Array.isArray(data.students)) {
+          setSelectedFile(file);
+          setParsedStudents(data.students);
+        } else {
+          throw new Error("No student records returned from server.");
+        }
+      })
+      .catch((err: any) => {
+        setErrorMsg(err?.message || "PDF parsing error.");
+      })
+      .finally(() => {
+        setUploading(false);
+      });
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
@@ -194,18 +228,18 @@ export default function UploadView({ scans, onStartAnalysis, onSelectScan, onDel
                 type="file" 
                 ref={fileInputRef} 
                 onChange={handleFileChange} 
-                accept=".xlsx,.xls,.csv" 
+                accept=".xlsx,.xls,.csv,.pdf" 
                 className="hidden" 
               />
               <div className="bg-white/5 text-slate-300 p-4 rounded-xl w-max mx-auto mb-4 border border-white/5">
                 <UploadCloud className="h-6 w-6 text-indigo-400" />
               </div>
-              <h4 className="text-sm font-semibold text-white mb-2 font-sans">Drag and drop file spreadsheet here</h4>
+              <h4 className="text-sm font-semibold text-white mb-2 font-sans">Drag and drop file here</h4>
               <p className="text-slate-500 text-xs max-w-md mx-auto mb-6 leading-relaxed">
-                Accepts standard Microsoft Excel (.xlsx, .xls) or comma-separated CSV lists. Columns must contain header labels resembling <strong className="text-slate-300">Student Name</strong> and <strong className="text-slate-300">GitHub Link</strong>.
+                Accepts Microsoft Excel (.xlsx, .xls), CSV lists, or PDF rosters containing student names and GitHub repository links.
               </p>
               <button className="bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 font-medium py-2 px-4 rounded-lg text-xs leading-none transition-colors cursor-pointer inline-flex items-center gap-1.5 font-sans">
-                <FileSpreadsheet className="h-3.5 w-3.5 text-indigo-400" /> Choose excel table
+                <FileText className="h-3.5 w-3.5 text-indigo-400" /> Choose roster file
               </button>
             </div>
           ) : (
@@ -214,7 +248,12 @@ export default function UploadView({ scans, onStartAnalysis, onSelectScan, onDel
               <div className="flex justify-between items-start border-b border-white/5 pb-4 mb-4">
                 <div>
                   <h4 className="text-sm font-semibold text-white flex items-center gap-2">
-                    <FileSpreadsheet className="h-4.5 w-4.5 text-indigo-400" /> {selectedFile.name}
+                    {selectedFile.name.toLowerCase().endsWith('.pdf') ? (
+                      <FileText className="h-4.5 w-4.5 text-indigo-400" />
+                    ) : (
+                      <FileSpreadsheet className="h-4.5 w-4.5 text-indigo-400" />
+                    )} 
+                    {selectedFile.name}
                   </h4>
                   <p className="text-xs text-slate-550">Found {parsedStudents.length} candidate records</p>
                 </div>

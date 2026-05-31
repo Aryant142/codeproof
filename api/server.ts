@@ -4,6 +4,9 @@ import { GoogleGenAI, Type } from '@google/genai';
 import * as dotenv from 'dotenv';
 import { db } from '../src/lib/firebase.js';
 import AdmZip from 'adm-zip';
+import { createRequire } from 'module';
+const requireHelper = createRequire(import.meta.url);
+const pdf = requireHelper('pdf-parse');
 
 dotenv.config();
 
@@ -90,8 +93,62 @@ app.get('/api/health', (req, res) => {
     isGroqQuotaExceeded,
     hasGroq,
     activeEngine: computedEngine,
-    localTime: new Date().toISOString()
   });
+});
+
+// Parse student roster from PDF file format
+app.post('/api/parse-pdf', express.raw({ type: 'application/pdf', limit: '10mb' }), async (req, res) => {
+  try {
+    const buffer = req.body;
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ error: "Empty or invalid PDF file buffer received." });
+    }
+
+    const parser = new pdf.PDFParse({ data: buffer });
+    const pdfData = await parser.getText();
+    const text = pdfData.text || "";
+    await parser.destroy();
+
+    const lines = text.split('\n');
+    const students: any[] = [];
+
+    // Capture github URL matching owner/repo
+    const githubRegex = /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/i;
+
+    for (const line of lines) {
+      const match = line.match(githubRegex);
+      if (match) {
+        const githubUrl = `https://github.com/${match[1]}/${match[2]}`;
+        // Clean line to isolate student name
+        let name = line.replace(match[0], "").trim();
+        // Remove common list prefixes, punctuation, leading/trailing numbers
+        name = name.replace(/^[\s,.:;\-\d#]+/g, "").replace(/[\s,.:;\-#]+$/g, "").trim();
+
+        // Fallback if name could not be cleaned properly
+        if (!name || name.length < 2) {
+          name = match[1]; // Use username
+        }
+
+        // De-duplicate URLs if same repo is parsed multiple times
+        if (!students.some(st => st.githubUrl.toLowerCase() === githubUrl.toLowerCase())) {
+          students.push({
+            studentName: name,
+            githubUrl: githubUrl,
+            isValidUrl: true
+          });
+        }
+      }
+    }
+
+    if (students.length === 0) {
+      return res.status(422).json({ error: "Could not extract any valid GitHub repository links from this PDF. Ensure it contains links in 'github.com/owner/repo' format." });
+    }
+
+    res.json({ students });
+  } catch (err: any) {
+    console.error("PDF Parsing crashed:", err);
+    res.status(500).json({ error: `Failed to parse PDF file: ${err?.message || err}` });
+  }
 });
 
 // Purge all history database and memory collections for a specific teacher ID
