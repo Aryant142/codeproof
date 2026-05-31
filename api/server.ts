@@ -4,7 +4,6 @@ import { GoogleGenAI, Type } from '@google/genai';
 import * as dotenv from 'dotenv';
 import { db } from '../src/lib/firebase.js';
 import AdmZip from 'adm-zip';
-import { extractText, getDocumentProxy } from 'unpdf';
 
 dotenv.config();
 
@@ -102,6 +101,7 @@ app.post('/api/parse-pdf', express.raw({ type: 'application/pdf', limit: '10mb' 
       return res.status(400).json({ error: "Empty or invalid PDF file buffer received." });
     }
 
+    const { getDocumentProxy, extractText } = await import('unpdf');
     const pdfDoc = await getDocumentProxy(new Uint8Array(buffer));
     const { text } = await extractText(pdfDoc, { mergePages: true });
 
