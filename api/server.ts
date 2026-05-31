@@ -4,7 +4,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import * as dotenv from 'dotenv';
 import { db } from '../src/lib/firebase.js';
 import AdmZip from 'adm-zip';
-import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { extractText, getDocumentProxy } from 'unpdf';
 
 dotenv.config();
 
@@ -102,49 +102,54 @@ app.post('/api/parse-pdf', express.raw({ type: 'application/pdf', limit: '10mb' 
       return res.status(400).json({ error: "Empty or invalid PDF file buffer received." });
     }
 
-    const loadingTask = pdfjs.getDocument({ 
-      data: new Uint8Array(buffer),
-      verbosity: 0
-    });
-    const pdfDoc = await loadingTask.promise;
-    
-    let text = "";
-    for (let i = 1; i <= pdfDoc.numPages; i++) {
-      const page = await pdfDoc.getPage(i);
-      const textContent = await page.getTextContent();
-      const pageText = textContent.items.map((item: any) => item.str).join(' ');
-      text += pageText + '\n';
-    }
+    const pdfDoc = await getDocumentProxy(new Uint8Array(buffer));
+    const { text } = await extractText(pdfDoc, { mergePages: true });
 
-    const lines = text.split('\n');
     const students: any[] = [];
-
     // Capture github URL matching owner/repo
-    const githubRegex = /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/i;
+    const githubRegex = /(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)/gi;
+    const matches = [...text.matchAll(githubRegex)];
 
-    for (const line of lines) {
-      const match = line.match(githubRegex);
-      if (match) {
-        const githubUrl = `https://github.com/${match[1]}/${match[2]}`;
-        // Clean line to isolate student name
-        let name = line.replace(match[0], "").trim();
-        // Remove common list prefixes, punctuation, leading/trailing numbers
-        name = name.replace(/^[\s,.:;\-\d#]+/g, "").replace(/[\s,.:;\-#]+$/g, "").trim();
+    let lastIndex = 0;
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i];
+      const url = match[0];
+      const matchIndex = text.indexOf(url, lastIndex);
+      
+      let segment = text.substring(lastIndex, matchIndex).trim();
+      
+      // Clean headers
+      segment = segment.replace(/Classroom Student Roster Submission/gi, "");
+      segment = segment.replace(/Student Roster/gi, "");
+      segment = segment.replace(/Roster/gi, "");
 
-        // Fallback if name could not be cleaned properly
-        if (!name || name.length < 2) {
-          name = match[1]; // Use username
-        }
+      let name = segment.replace(/^[\s,.:;\-\d#]+/g, "").replace(/[\s,.:;\-#]+$/g, "").trim();
 
-        // De-duplicate URLs if same repo is parsed multiple times
-        if (!students.some(st => st.githubUrl.toLowerCase() === githubUrl.toLowerCase())) {
-          students.push({
-            studentName: name,
-            githubUrl: githubUrl,
-            isValidUrl: true
-          });
-        }
+      // If segment contains multiple lines, take the last one
+      const segmentLines = name.split('\n').map(l => l.trim()).filter(Boolean);
+      if (segmentLines.length > 0) {
+        name = segmentLines[segmentLines.length - 1];
       }
+      
+      // Clean name again
+      name = name.replace(/^[\s,.:;\-\d#]+/g, "").replace(/[\s,.:;\-#]+$/g, "").trim();
+
+      // Fallback if name could not be cleaned properly
+      if (!name || name.length < 2) {
+        name = match[1]; // Use username
+      }
+
+      const githubUrl = `https://github.com/${match[1]}/${match[2]}`;
+      // De-duplicate URLs if same repo is parsed multiple times
+      if (!students.some(st => st.githubUrl.toLowerCase() === githubUrl.toLowerCase())) {
+        students.push({
+          studentName: name,
+          githubUrl: githubUrl,
+          isValidUrl: true
+        });
+      }
+
+      lastIndex = matchIndex + url.length;
     }
 
     if (students.length === 0) {
