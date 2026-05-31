@@ -4,9 +4,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import * as dotenv from 'dotenv';
 import { db } from '../src/lib/firebase.js';
 import AdmZip from 'adm-zip';
-import { createRequire } from 'module';
-const requireHelper = createRequire(import.meta.url);
-const pdf = requireHelper('pdf-parse');
+import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 dotenv.config();
 
@@ -104,10 +102,19 @@ app.post('/api/parse-pdf', express.raw({ type: 'application/pdf', limit: '10mb' 
       return res.status(400).json({ error: "Empty or invalid PDF file buffer received." });
     }
 
-    const parser = new pdf.PDFParse({ data: buffer });
-    const pdfData = await parser.getText();
-    const text = pdfData.text || "";
-    await parser.destroy();
+    const loadingTask = pdfjs.getDocument({ 
+      data: new Uint8Array(buffer),
+      verbosity: 0
+    });
+    const pdfDoc = await loadingTask.promise;
+    
+    let text = "";
+    for (let i = 1; i <= pdfDoc.numPages; i++) {
+      const page = await pdfDoc.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map((item: any) => item.str).join(' ');
+      text += pageText + '\n';
+    }
 
     const lines = text.split('\n');
     const students: any[] = [];
